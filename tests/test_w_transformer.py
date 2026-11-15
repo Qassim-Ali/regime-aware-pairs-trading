@@ -76,14 +76,11 @@ def test_wavelet_dataset_uses_existing_spread_data_pipeline_output():
         levels=2,
     )
 
-    # SpreadData input is multivariate (spread + z_score), 3 bands each -> 6
-    # components. The 10-day rolling z drops 9 warm-up rows: 70-9-12-2+1 = 48.
-    assert dataset.feature_names == ("spread", "z_score")
-    assert dataset.n_samples == 48
-    assert dataset.x.shape == (48, 12, 6)
-    assert dataset.y_components.shape == (48, 2, 6)
-    assert dataset.y_spread.shape == (48, 2)
-    assert list(dataset.target_index[:2]) == list(spread_data.spread.index[21:23])
+    assert dataset.n_samples == 57
+    assert dataset.x.shape == (57, 12, 3)
+    assert dataset.y_components.shape == (57, 2, 3)
+    assert dataset.y_spread.shape == (57, 2)
+    assert list(dataset.target_index[:2]) == list(spread_data.spread.index[12:14])
     assert dataset.scaling is not None
     assert np.isfinite(dataset.x).all()
     assert np.isfinite(dataset.y_components).all()
@@ -104,7 +101,7 @@ def test_latest_wavelet_window_uses_dataset_scaling():
         scaling=dataset.scaling,
     )
 
-    assert latest_window.shape == (1, 12, 6)  # spread + z_score, 3 bands each
+    assert latest_window.shape == (1, 12, 3)
     assert np.isfinite(latest_window).all()
 
 
@@ -136,7 +133,7 @@ def test_wavelet_transformer_forward_returns_recombined_forecast():
     component_forecast = model.predict_components(batch)
     spread_forecast = model(batch)
 
-    assert component_forecast.shape == (4, 3, 6)  # spread + z_score, 3 bands each
+    assert component_forecast.shape == (4, 3, 3)
     assert spread_forecast.shape == (4, 3)
     torch.testing.assert_close(
         spread_forecast,

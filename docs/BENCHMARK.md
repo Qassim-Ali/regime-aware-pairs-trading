@@ -7,7 +7,7 @@ trade rule. If a model wins here, it's the architecture, not a different setup.
 ## Run it
 
 ```bash
-uv sync                                                    # once
+uv sync --extra ml                                         # once (torch is an optional extra)
 uv run python -m pairs_trading.benchmark --config configs/smoke.toml      # offline, ~1 min
 uv run python -m pairs_trading.benchmark --config configs/benchmark.toml  # real data
 ```

@@ -24,10 +24,9 @@ Only windows where a real trade signal exists are used to train the gate.
 
 H selection
 -----------
-H is forced explicitly (train.py --force-h) and must be identical for every
-pair in a training run. It is frozen in a LabelConfig and stored in the
-ModelBundle — never recomputed at demo or inference time. (An earlier
-half-life-based auto-selection mode was removed: it made runs incomparable.)
+TFT takes an explicit H (train.py --force-h) shared by all pairs in the run.
+It is frozen in a LabelConfig and stored in the ModelBundle. Autoformer can
+use sweep_forward_window and recommend_forward_window to choose H per pair.
 
 Public API
 ----------
@@ -123,7 +122,7 @@ def generate_regime_labels(
     spread_data: SpreadData,
     *,
     forward_window: int,
-    entry_threshold: float = DEFAULT_ENTRY_THRESHOLD,
+    entry_threshold: float = 1.5,
     reversion_target: float = DEFAULT_REVERSION_TARGET,
     stop_loss: float = DEFAULT_STOP_LOSS,
     fill_no_entry: bool = False,
@@ -131,15 +130,13 @@ def generate_regime_labels(
 ) -> pd.Series:
     """Binary regime labels aligned to the spread index.
 
-    ``stop_rule``:
-      "any"         (legacy default) label 0 if |z| touches stop_loss anywhere in
-                    the forward window, even after a successful reversion.
-      "first_touch" path-dependent: whichever of reversion_target / stop_loss is
-                    hit first decides the label. Matches how a trade actually
-                    exits; the benchmark pipeline uses this.
-
-    ``fill_no_entry`` (from the Autoformer branch): label no-signal steps 0
-    instead of -1 to get a dense array.
+    ``stop_rule`` decides how the stop-loss is applied:
+      "any"          (default, unchanged behaviour) label 0 if |z| touches
+                     stop_loss anywhere in the forward window, even if the
+                     trade had already reverted earlier in the window.
+      "first_touch"  whichever of reversion_target / stop_loss is hit FIRST
+                     decides the label, matching how a live trade exits.
+                     Used by the benchmark pipeline (pairs_trading.benchmark).
 
     For each timestep t:
       1. |z_t| >= entry_threshold? If not → -1 (no trade signal; excluded
@@ -152,8 +149,8 @@ def generate_regime_labels(
        0  unfavorable / stopped out
       -1  no entry signal (excluded from training)
 
-    The trailing forward_window timesteps cannot be labeled (their outcome is
-    unknown) and are always -1.
+    By default, no-entry rows and the trailing rows with unknown outcomes
+    are -1. Set fill_no_entry=True to mark those rows as 0 instead.
     """
     if forward_window < 1:
         raise ValueError("forward_window must be at least 1")
@@ -167,15 +164,13 @@ def generate_regime_labels(
     z = spread_data.z_score.dropna().astype(float)
     values = z.to_numpy()
     n = len(values)
-    labels = np.full(n, -1, dtype=np.int8)
+    labels = np.full(n, 0 if fill_no_entry else -1, dtype=np.int8)
 
     for t in range(n - forward_window):
         z_t = values[t]
 
         # Step 1: entry signal check
         if abs(z_t) < entry_threshold:
-            if fill_no_entry:
-                labels[t] = 0
             continue
 
         forward = values[t + 1 : t + 1 + forward_window]
@@ -195,16 +190,13 @@ def generate_regime_labels(
         else:
             labels[t] = 1 if np.any(forward >= -reversion_target) else 0
 
-    if fill_no_entry:
-        labels[max(n - forward_window, 0) :] = 0
-
     return pd.Series(labels, index=z.index, name="regime_label", dtype=np.int8)
 
 
 def _first_touch_label(
     z_t: float, forward: np.ndarray, reversion_target: float, stop_loss: float
 ) -> int:
-    """1 if the reversion target is reached before the stop, else 0."""
+    """1 if the reversion target is reached strictly before the stop, else 0."""
     hit_target = (
         forward <= reversion_target if z_t > 0 else forward >= -reversion_target
     )
@@ -218,12 +210,9 @@ def generate_simple_reversion_labels(
     spread_data: SpreadData,
     *,
     forward_window: int,
-    reversion_target: float = DEFAULT_REVERSION_TARGET,
+    reversion_target: float = 0.5,
 ) -> pd.Series:
-    """Unconditional reversion labels for every timestep (sanity checks).
-
-    Ported from the Autoformer / W-Transformer branches.
-    """
+    """Unconditional reversion labels for every timestep (sanity checks)."""
     if forward_window < 1:
         raise ValueError("forward_window must be at least 1")
 
@@ -233,8 +222,9 @@ def generate_simple_reversion_labels(
     labels = np.zeros(n, dtype=np.int8)
 
     for t in range(n - forward_window):
+        z_t = values[t]
         forward = values[t + 1 : t + 1 + forward_window]
-        if values[t] > 0:
+        if z_t > 0:
             labels[t] = 1 if np.any(forward <= reversion_target) else 0
         else:
             labels[t] = 1 if np.any(forward >= -reversion_target) else 0
@@ -247,14 +237,19 @@ def sweep_forward_window(
     *,
     candidates: tuple = (3, 5, 8, 10, 13, 16, 20, 25, 30, 36, 45),
     entry_threshold: float = 1.5,
-    reversion_target: float = DEFAULT_REVERSION_TARGET,
-    stop_loss: float = DEFAULT_STOP_LOSS,
+    reversion_target: float = 0.5,
+    stop_loss: float = 3.0,
     target_balance: float = 0.5,
 ) -> pd.DataFrame:
-    """Sweep H candidates and report label balance for each (Autoformer branch).
+    """
+    Sweep H candidates and report label balance for each.
 
-    NOTE: for benchmarking, H must be fixed and shared across models and pairs
-    (see LabelConfig). Use this only for exploration.
+    Pick the H whose positive-label fraction is closest to
+    ``target_balance`` (default 0.5 -- maximum label informativeness).
+
+    Returns a DataFrame sorted by the sweep order with columns:
+        H, n_favorable, n_unfavorable, n_labeled, balance, distance_to_target
+    The recommended H is ``df.loc[df.distance_to_target.idxmin(), "H"]``.
     """
     rows = []
     for h in candidates:
@@ -264,6 +259,7 @@ def sweep_forward_window(
             entry_threshold=entry_threshold,
             reversion_target=reversion_target,
             stop_loss=stop_loss,
+            fill_no_entry=False,
         )
         n_fav = int((labels == 1).sum())
         n_unfav = int((labels == 0).sum())
@@ -284,7 +280,10 @@ def sweep_forward_window(
     return pd.DataFrame(rows)
 
 
-def recommend_forward_window(spread_data: SpreadData, **sweep_kwargs) -> tuple:
+def recommend_forward_window(
+    spread_data: SpreadData,
+    **sweep_kwargs,
+) -> tuple:
     """Convenience wrapper: returns (recommended_H, sweep_dataframe)."""
     df = sweep_forward_window(spread_data, **sweep_kwargs)
     best = df.loc[df["distance_to_target"].idxmin()]
@@ -300,7 +299,7 @@ def align_labels_to_dataset(
     labels: pd.Series,
     target_index: pd.Index,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Align a label Series to TFTWindowData.target_index.
+    """Align a label Series to model window timestamps.
 
     Returns
     -------
@@ -314,7 +313,7 @@ def align_labels_to_dataset(
         raise ValueError(
             "Some window timestamps in target_index have no corresponding label. "
             "Ensure labels were generated from the same SpreadData used to build "
-            "the TFTWindowData."
+            "the model windows."
         )
 
     labels_array = aligned.to_numpy(dtype=np.int8)

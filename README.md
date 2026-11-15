@@ -47,7 +47,7 @@ one benchmark pipeline: same data, features, labels, walk-forward splits, traini
 entry/exit rule.
 
 ```bash
-uv sync
+uv sync --extra ml   # torch is an optional extra
 uv run python -m pairs_trading.benchmark --config configs/smoke.toml      # offline smoke test
 uv run python -m pairs_trading.benchmark --config configs/benchmark.toml  # real data
 ```
